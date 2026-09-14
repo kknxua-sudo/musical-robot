@@ -14,7 +14,8 @@ const MEDIA_DIR = path.join(ROOT, 'server', 'media');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = process.env.JWT_SECRET || 'lumin-local-secret-change-me';
-const AUDIO_COM_TOKEN = process.env.AUDIO_COM_TOKEN || '';
+const AUDIUS_API = process.env.AUDIUS_API_URL || 'https://discoveryprovider.audius.co/v1';
+const AUDIUS_API_KEY = process.env.AUDIUS_API_KEY || '';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
@@ -32,35 +33,55 @@ const upload = multer({ storage, limits: { fileSize: 75 * 1024 * 1024 }, fileFil
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/api/audio/search', async (req, res) => {
-  const query = String(req.query.q || 'play').trim();
-  if (!AUDIO_COM_TOKEN) return res.status(503).json({ message: 'Audio.com is not connected. Add AUDIO_COM_TOKEN to the server environment.', connected: false });
+async function audius(pathname, params = {}) {
+  const url = new URL(`${AUDIUS_API}${pathname}`);
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, String(v)); });
+  const headers = AUDIUS_API_KEY ? { Authorization: `Bearer ${AUDIUS_API_KEY}` } : {};
+  const response = await fetch(url, { headers });
+  if (!response.ok) throw new Error(`Audius returned ${response.status}`);
+  return response.json();
+}
+
+function normalizeTrack(track) {
+  const artwork = typeof track.artwork === 'string' ? track.artwork : track.artwork?.['1000x1000'] || track.artwork?.['480x480'] || track.artwork?.['150x150'] || '';
+  return {
+    id: track.id,
+    title: track.title || 'Untitled',
+    artist: track.user?.name || track.user?.handle || 'Audius artist',
+    album: track.playlist_name || 'Audius',
+    genre: track.genre || 'Music',
+    artwork,
+    duration: Number(track.duration || 0),
+    source: 'Audius',
+    permalink: track.permalink || null,
+    streamUrl: `/api/music/stream/${encodeURIComponent(track.id)}`
+  };
+}
+
+app.get('/api/music/trending', async (req, res) => {
   try {
-    const url = new URL('https://api.audio.com/v1/search');
-    url.searchParams.set('q', query);
-    url.searchParams.set('types', 'audio');
-    url.searchParams.set('page', String(Math.max(1, Number(req.query.page || 1))));
-    const response = await fetch(url, { headers: { Authorization: `Bearer ${AUDIO_COM_TOKEN}`, Accept: 'application/json' } });
-    const body = await response.json();
-    if (!response.ok) return res.status(response.status).json({ message: body?.message || 'Audio.com search failed.', connected: true });
-    const items = Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [];
-    const tracks = items.map((item) => {
-      const model = item?.model || item;
-      return {
-        source: 'audio.com',
-        id: model.id,
-        title: model.title || model.name || 'Untitled',
-        artist: model.author_name || model.username || 'Audio.com',
-        artwork: model.image || '',
-        duration: Number(model?.play?.duration || 0),
-        streamUrl: model?.play?.url || null,
-        slug: model.slug || ''
-      };
-    }).filter((t) => t.streamUrl);
-    res.json({ connected: true, tracks });
+    const data = await audius('/tracks/trending', { limit: Math.min(Number(req.query.limit) || 24, 100), offset: Math.max(Number(req.query.offset) || 0, 0) });
+    res.json({ tracks: (data.data || []).map(normalizeTrack) });
   } catch (error) {
-    res.status(502).json({ message: error.message || 'Audio.com is unavailable.', connected: true });
+    res.status(502).json({ message: error.message || 'Live music catalog unavailable.' });
   }
+});
+
+app.get('/api/music/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ tracks: [] });
+  try {
+    const data = await audius('/tracks/search', { query: q, limit: Math.min(Number(req.query.limit) || 24, 50), sort_method: 'relevant' });
+    res.json({ tracks: (data.data || []).map(normalizeTrack) });
+  } catch (error) {
+    res.status(502).json({ message: error.message || 'Live music search unavailable.' });
+  }
+});
+
+app.get('/api/music/stream/:id', (req, res) => {
+  const url = new URL(`${AUDIUS_API}/tracks/${encodeURIComponent(req.params.id)}/stream`);
+  if (AUDIUS_API_KEY) url.searchParams.set('api_key', AUDIUS_API_KEY);
+  res.redirect(302, url.toString());
 });
 
 app.post('/api/register', async (req, res) => { const { email, password, name } = req.body || {}; if (!email || !password || !name || password.length < 6) return res.status(400).json({ message: 'Name, email, and a 6+ character password are required.' }); const db = readDb(); if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ message: 'An account with that email already exists.' }); const user = { id: crypto.randomUUID(), email: email.toLowerCase().trim(), name: name.trim(), passwordHash: await bcrypt.hash(password, 10), createdAt: new Date().toISOString() }; db.users.push(user); writeDb(db); const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); res.json({ token, user: safeUser(user) }); });
@@ -74,6 +95,7 @@ app.post('/api/playlists', auth, (req, res) => { const name = String(req.body?.n
 app.post('/api/playlists/:id/tracks', auth, (req, res) => { const db = readDb(); const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id); const track = db.tracks.find(t => t.id === req.body?.trackId); if (!playlist || !track) return res.status(404).json({ message: 'Playlist or track not found.' }); if (!playlist.trackIds.includes(track.id)) playlist.trackIds.push(track.id); writeDb(db); res.json({ ok: true }); });
 app.delete('/api/playlists/:id/tracks/:trackId', auth, (req, res) => { const db = readDb(); const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id); if (!playlist) return res.status(404).json({ message: 'Playlist not found.' }); playlist.trackIds = playlist.trackIds.filter(id => id !== req.params.trackId); writeDb(db); res.json({ ok: true }); });
 app.delete('/api/playlists/:id', auth, (req, res) => { const db = readDb(); const before = db.playlists.length; db.playlists = db.playlists.filter(p => !(p.id === req.params.id && p.ownerId === req.user.id)); writeDb(db); res.json({ ok: db.playlists.length !== before }); });
+
 app.use(express.static(path.join(ROOT, 'dist')));
 app.use((error, _req, res, _next) => res.status(400).json({ message: error.message || 'Request failed.' }));
 app.get('*', (_, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
