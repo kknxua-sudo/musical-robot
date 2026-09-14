@@ -1,10 +1,10 @@
 {
   "name":"musical-robot",
-  "version":"1.0.0",
+  "version":"1.0.1",
   "private":true,
   "type":"module",
   "engines":{"node":">=20"},
-  "scripts":{"dev":"concurrently \"node server/index.js\" \"vite --host 0.0.0.0\"","build":"vite build","start":"node server/index.js","preview":"vite preview --host 0.0.0.0"},
+  "scripts":{"dev":"concurrently \"node server/index.js\" \"vite --host 0.0.0.0\"","build":"vite build","start":"npm run build && node server/index.js","preview":"vite preview --host 0.0.0.0"},
   "dependencies":{
     "@vitejs/plugin-react":"^4.4.1",
     "bcryptjs":"^2.4.3",
