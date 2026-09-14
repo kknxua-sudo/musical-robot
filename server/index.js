@@ -17,159 +17,60 @@ const JWT_SECRET = process.env.JWT_SECRET || 'lumin-local-secret-change-me';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
-if (!fs.existsSync(DB_FILE)) {
-  fs.writeFileSync(DB_FILE, JSON.stringify({ users: [], tracks: [], playlists: [] }, null, 2));
-}
+if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: [], tracks: [], playlists: [] }, null, 2));
 const readDb = () => JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 const writeDb = (db) => fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 const safeUser = (u) => ({ id: u.id, email: u.email, name: u.name, createdAt: u.createdAt });
-const auth = (req, res, next) => {
-  const raw = req.headers.authorization || '';
-  if (!raw.startsWith('Bearer ')) return res.status(401).json({ message: 'Authentication required.' });
-  try {
-    req.user = jwt.verify(raw.slice(7), JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ message: 'Session expired.' });
-  }
-};
+const auth = (req, res, next) => { const raw = req.headers.authorization || ''; if (!raw.startsWith('Bearer ')) return res.status(401).json({ message: 'Authentication required.' }); try { req.user = jwt.verify(raw.slice(7), JWT_SECRET); next(); } catch { res.status(401).json({ message: 'Session expired.' }); } };
 
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, MEDIA_DIR),
-  filename: (_, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${crypto.randomUUID()}${ext}`);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 75 * 1024 * 1024 },
-  fileFilter: (_, file, cb) => {
-    const allowed = /^audio\/(mpeg|mp3|wav|ogg|webm|mp4|aac|flac)$/i.test(file.mimetype) || /\.(mp3|wav|ogg|webm|m4a|aac|flac)$/i.test(file.originalname);
-    cb(allowed ? null : new Error('Audio files only.'), allowed);
-  }
-});
+const storage = multer.diskStorage({ destination: (_, __, cb) => cb(null, MEDIA_DIR), filename: (_, file, cb) => cb(null, `${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`) });
+const upload = multer({ storage, limits: { fileSize: 75 * 1024 * 1024 }, fileFilter: (_, file, cb) => { const ok = /^audio\/(mpeg|mp3|wav|ogg|webm|mp4|aac|flac)$/i.test(file.mimetype) || /\.(mp3|wav|ogg|webm|m4a|aac|flac)$/i.test(file.originalname); cb(ok ? null : new Error('Audio files only.'), ok); } });
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+
+let audioComCache = { at: 0, tracks: [] };
+const AUDIO_SEARCH_URL = 'https://audio.com/search/category/music';
+const unescape = (s) => s.replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+const fetchText = async (url) => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 9000); try { const r = await fetch(url, { signal: controller.signal, headers: { 'user-agent': 'LuminMusic/1.0 (+public-audio-catalog)' } }); if (!r.ok) throw new Error(`Audio.com returned ${r.status}`); return await r.text(); } finally { clearTimeout(timer); } };
+const first = (html, regex) => { const m = html.match(regex); return m ? unescape(m[1]) : null; };
+const getAudioComCatalog = async () => {
+  if (Date.now() - audioComCache.at < 5 * 60 * 1000 && audioComCache.tracks.length) return audioComCache.tracks;
+  const page = await fetchText(AUDIO_SEARCH_URL);
+  const links = [...page.matchAll(/href=["'](\/[^"']+\/audio\/[^"']+)["']/gi)].map(m => `https://audio.com${m[1]}`);
+  const unique = [...new Set(links)].slice(0, 18);
+  const tracks = [];
+  for (const url of unique) {
+    try {
+      const html = await fetchText(url);
+      const stream = first(html, /"play"\s*:\s*\{\s*"duration"\s*:\s*(\d+)\s*,\s*"url"\s*:\s*"([^"]+)"/i) || null;
+      const title = first(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i) || first(html, /<h1[^>]*>([^<]+)</i) || 'Audio.com track';
+      const author = first(html, /<meta[^>]+name=["']author["'][^>]+content=["']([^"']+)/i) || first(html, /"author_name"\s*:\s*"([^"]+)/i) || 'Audio.com creator';
+      const image = first(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i) || null;
+      const duration = stream ? Number(stream[1]) : 0;
+      const streamUrl = stream ? stream[2].replace(/\\u0026/g, '&').replace(/\\\//g, '/') : null;
+      if (streamUrl) tracks.push({ id: `audio-${crypto.createHash('sha1').update(url).digest('hex').slice(0, 12)}`, title, artist: author, album: 'Audio.com', artworkUrl: image, duration, streamUrl, sourceUrl: url, source: 'Audio.com' });
+    } catch { /* skip a track that changed shape */ }
+  }
+  if (tracks.length) audioComCache = { at: Date.now(), tracks };
+  return audioComCache.tracks;
+};
+
+app.get('/api/audio/catalog', async (_req, res) => { try { res.json({ source: 'Audio.com', refreshedAt: new Date().toISOString(), tracks: await getAudioComCatalog() }); } catch (e) { res.status(502).json({ message: 'Audio.com catalog is temporarily unavailable.', details: e.message }); } });
+
+app.post('/api/register', async (req, res) => { const { email, password, name } = req.body || {}; if (!email || !password || !name || password.length < 6) return res.status(400).json({ message: 'Name, email, and a 6+ character password are required.' }); const db = readDb(); if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ message: 'An account with that email already exists.' }); const user = { id: crypto.randomUUID(), email: email.toLowerCase().trim(), name: name.trim(), passwordHash: await bcrypt.hash(password, 10), createdAt: new Date().toISOString() }; db.users.push(user); writeDb(db); const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); res.json({ token, user: safeUser(user) }); });
+app.post('/api/login', async (req, res) => { const { email, password } = req.body || {}; const db = readDb(); const user = db.users.find(u => u.email.toLowerCase() === String(email || '').toLowerCase()); if (!user || !(await bcrypt.compare(password || '', user.passwordHash))) return res.status(401).json({ message: 'Email or password is incorrect.' }); const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); res.json({ token, user: safeUser(user) }); });
+app.get('/api/me', auth, (req, res) => { const db = readDb(); const user = db.users.find(u => u.id === req.user.id); if (!user) return res.status(404).json({ message: 'User not found.' }); res.json({ user: safeUser(user) }); });
+app.get('/api/tracks', (_, res) => { const db = readDb(); res.json({ tracks: db.tracks.map(t => ({ ...t, streamUrl: t.filename ? `/api/stream/${t.id}` : null })) }); });
+app.post('/api/tracks', auth, upload.single('audio'), (req, res) => { if (!req.file) return res.status(400).json({ message: 'Choose an audio file.' }); const db = readDb(); const track = { id: crypto.randomUUID(), title: String(req.body.title || path.parse(req.file.originalname).name).trim(), artist: String(req.body.artist || 'Your Library').trim(), album: String(req.body.album || 'Uploads').trim(), genre: String(req.body.genre || 'Uploaded').trim(), artwork: ['linear-gradient(135deg,#c084fc,#ec4899)', 'linear-gradient(135deg,#60a5fa,#2563eb)', 'linear-gradient(135deg,#fb7185,#f97316)'][db.tracks.length % 3], filename: req.file.filename, size: req.file.size, ownerId: req.user.id, uploadedAt: new Date().toISOString() }; db.tracks.unshift(track); writeDb(db); res.status(201).json({ track: { ...track, streamUrl: `/api/stream/${track.id}` } }); });
+app.get('/api/stream/:id', (req, res) => { const db = readDb(); const track = db.tracks.find(t => t.id === req.params.id); if (!track?.filename) return res.status(404).end(); const filePath = path.join(MEDIA_DIR, track.filename); if (!fs.existsSync(filePath)) return res.status(404).end(); const stat = fs.statSync(filePath); const range = req.headers.range; const types = { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.webm': 'audio/webm', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac' }; res.setHeader('Content-Type', types[path.extname(filePath).toLowerCase()] || 'application/octet-stream'); if (!range) return res.status(200).set('Content-Length', stat.size).sendFile(filePath); const [startText, endText] = range.replace(/bytes=/, '').split('-'); const start = Number(startText); const end = endText ? Number(endText) : stat.size - 1; const chunk = end - start + 1; res.status(206).set({ 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Accept-Ranges': 'bytes', 'Content-Length': chunk }); fs.createReadStream(filePath, { start, end }).pipe(res); });
+app.get('/api/playlists', auth, (req, res) => { const db = readDb(); res.json({ playlists: db.playlists.filter(p => p.ownerId === req.user.id).map(p => ({ ...p, tracks: p.trackIds.map(id => db.tracks.find(t => t.id === id)).filter(Boolean) })) }); });
+app.post('/api/playlists', auth, (req, res) => { const name = String(req.body?.name || 'New Playlist').trim(); const db = readDb(); const playlist = { id: crypto.randomUUID(), name, ownerId: req.user.id, trackIds: [], createdAt: new Date().toISOString() }; db.playlists.unshift(playlist); writeDb(db); res.status(201).json({ playlist: { ...playlist, tracks: [] } }); });
+app.post('/api/playlists/:id/tracks', auth, (req, res) => { const db = readDb(); const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id); const track = db.tracks.find(t => t.id === req.body?.trackId); if (!playlist || !track) return res.status(404).json({ message: 'Playlist or track not found.' }); if (!playlist.trackIds.includes(track.id)) playlist.trackIds.push(track.id); writeDb(db); res.json({ ok: true }); });
+app.delete('/api/playlists/:id/tracks/:trackId', auth, (req, res) => { const db = readDb(); const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id); if (!playlist) return res.status(404).json({ message: 'Playlist not found.' }); playlist.trackIds = playlist.trackIds.filter(id => id !== req.params.trackId); writeDb(db); res.json({ ok: true }); });
+app.delete('/api/playlists/:id', auth, (req, res) => { const db = readDb(); const before = db.playlists.length; db.playlists = db.playlists.filter(p => !(p.id === req.params.id && p.ownerId === req.user.id)); writeDb(db); res.json({ ok: db.playlists.length !== before }); });
+
 app.use(express.static(path.join(ROOT, 'dist')));
-
-app.post('/api/register', async (req, res) => {
-  const { email, password, name } = req.body || {};
-  if (!email || !password || !name || password.length < 6) return res.status(400).json({ message: 'Name, email, and a 6+ character password are required.' });
-  const db = readDb();
-  if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ message: 'An account with that email already exists.' });
-  const user = { id: crypto.randomUUID(), email: email.toLowerCase().trim(), name: name.trim(), passwordHash: await bcrypt.hash(password, 10), createdAt: new Date().toISOString() };
-  db.users.push(user);
-  writeDb(db);
-  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: safeUser(user) });
-});
-
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  const db = readDb();
-  const user = db.users.find(u => u.email.toLowerCase() === String(email || '').toLowerCase());
-  if (!user || !(await bcrypt.compare(password || '', user.passwordHash))) return res.status(401).json({ message: 'Email or password is incorrect.' });
-  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: safeUser(user) });
-});
-
-app.get('/api/me', auth, (req, res) => {
-  const db = readDb();
-  const user = db.users.find(u => u.id === req.user.id);
-  if (!user) return res.status(404).json({ message: 'User not found.' });
-  res.json({ user: safeUser(user) });
-});
-
-app.get('/api/tracks', (_, res) => {
-  const db = readDb();
-  const tracks = db.tracks.map(t => ({ ...t, streamUrl: t.filename ? `/api/stream/${t.id}` : null }));
-  res.json({ tracks });
-});
-
-app.post('/api/tracks', auth, upload.single('audio'), (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Choose an audio file.' });
-  const db = readDb();
-  const track = {
-    id: crypto.randomUUID(),
-    title: String(req.body.title || path.parse(req.file.originalname).name).trim(),
-    artist: String(req.body.artist || 'Your Library').trim(),
-    album: String(req.body.album || 'Uploads').trim(),
-    genre: String(req.body.genre || 'Uploaded').trim(),
-    artwork: ['linear-gradient(135deg,#c084fc,#ec4899)', 'linear-gradient(135deg,#60a5fa,#2563eb)', 'linear-gradient(135deg,#fb7185,#f97316)'][db.tracks.length % 3],
-    filename: req.file.filename,
-    size: req.file.size,
-    ownerId: req.user.id,
-    uploadedAt: new Date().toISOString()
-  };
-  db.tracks.unshift(track);
-  writeDb(db);
-  res.status(201).json({ track: { ...track, streamUrl: `/api/stream/${track.id}` } });
-});
-
-app.get('/api/stream/:id', (req, res) => {
-  const db = readDb();
-  const track = db.tracks.find(t => t.id === req.params.id);
-  if (!track?.filename) return res.status(404).end();
-  const filePath = path.join(MEDIA_DIR, track.filename);
-  if (!fs.existsSync(filePath)) return res.status(404).end();
-  const stat = fs.statSync(filePath);
-  const range = req.headers.range;
-  const ext = path.extname(filePath).toLowerCase();
-  const types = { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.webm': 'audio/webm', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac' };
-  res.setHeader('Content-Type', types[ext] || 'application/octet-stream');
-  if (!range) return res.status(200).set('Content-Length', stat.size).sendFile(filePath);
-  const [startText, endText] = range.replace(/bytes=/, '').split('-');
-  const start = Number(startText);
-  const end = endText ? Number(endText) : stat.size - 1;
-  const chunk = end - start + 1;
-  res.status(206).set({ 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Accept-Ranges': 'bytes', 'Content-Length': chunk });
-  fs.createReadStream(filePath, { start, end }).pipe(res);
-});
-
-app.get('/api/playlists', auth, (req, res) => {
-  const db = readDb();
-  const playlists = db.playlists.filter(p => p.ownerId === req.user.id).map(p => ({ ...p, tracks: p.trackIds.map(id => db.tracks.find(t => t.id === id)).filter(Boolean) }));
-  res.json({ playlists });
-});
-
-app.post('/api/playlists', auth, (req, res) => {
-  const name = String(req.body?.name || 'New Playlist').trim();
-  const db = readDb();
-  const playlist = { id: crypto.randomUUID(), name, ownerId: req.user.id, trackIds: [], createdAt: new Date().toISOString() };
-  db.playlists.unshift(playlist);
-  writeDb(db);
-  res.status(201).json({ playlist: { ...playlist, tracks: [] } });
-});
-
-app.post('/api/playlists/:id/tracks', auth, (req, res) => {
-  const db = readDb();
-  const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id);
-  const track = db.tracks.find(t => t.id === req.body?.trackId);
-  if (!playlist || !track) return res.status(404).json({ message: 'Playlist or track not found.' });
-  if (!playlist.trackIds.includes(track.id)) playlist.trackIds.push(track.id);
-  writeDb(db);
-  res.json({ ok: true });
-});
-
-app.delete('/api/playlists/:id/tracks/:trackId', auth, (req, res) => {
-  const db = readDb();
-  const playlist = db.playlists.find(p => p.id === req.params.id && p.ownerId === req.user.id);
-  if (!playlist) return res.status(404).json({ message: 'Playlist not found.' });
-  playlist.trackIds = playlist.trackIds.filter(id => id !== req.params.trackId);
-  writeDb(db);
-  res.json({ ok: true });
-});
-
-app.delete('/api/playlists/:id', auth, (req, res) => {
-  const db = readDb();
-  const before = db.playlists.length;
-  db.playlists = db.playlists.filter(p => !(p.id === req.params.id && p.ownerId === req.user.id));
-  writeDb(db);
-  res.json({ ok: db.playlists.length !== before });
-});
-
 app.use((error, _req, res, _next) => res.status(400).json({ message: error.message || 'Request failed.' }));
 app.get('*', (_, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
 app.listen(PORT, '0.0.0.0', () => console.log(`Lumin server running on ${PORT}`));
