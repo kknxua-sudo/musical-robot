@@ -14,6 +14,7 @@ const MEDIA_DIR = path.join(ROOT, 'server', 'media');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET = process.env.JWT_SECRET || 'lumin-local-secret-change-me';
+const AUDIO_COM_TOKEN = process.env.AUDIO_COM_TOKEN || '';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
@@ -30,6 +31,38 @@ const storage = multer.diskStorage({ destination: (_, __, cb) => cb(null, MEDIA_
 const upload = multer({ storage, limits: { fileSize: 75 * 1024 * 1024 }, fileFilter: (_, file, cb) => { const ok = /^audio\/(mpeg|mp3|wav|ogg|webm|mp4|aac|flac)$/i.test(file.mimetype) || /\.(mp3|wav|ogg|webm|m4a|aac|flac)$/i.test(file.originalname); cb(ok ? null : new Error('Audio files only.'), ok); } });
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+
+app.get('/api/audio/search', async (req, res) => {
+  const query = String(req.query.q || 'play').trim();
+  if (!AUDIO_COM_TOKEN) return res.status(503).json({ message: 'Audio.com is not connected. Add AUDIO_COM_TOKEN to the server environment.', connected: false });
+  try {
+    const url = new URL('https://api.audio.com/v1/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('types', 'audio');
+    url.searchParams.set('page', String(Math.max(1, Number(req.query.page || 1))));
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${AUDIO_COM_TOKEN}`, Accept: 'application/json' } });
+    const body = await response.json();
+    if (!response.ok) return res.status(response.status).json({ message: body?.message || 'Audio.com search failed.', connected: true });
+    const items = Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [];
+    const tracks = items.map((item) => {
+      const model = item?.model || item;
+      return {
+        source: 'audio.com',
+        id: model.id,
+        title: model.title || model.name || 'Untitled',
+        artist: model.author_name || model.username || 'Audio.com',
+        artwork: model.image || '',
+        duration: Number(model?.play?.duration || 0),
+        streamUrl: model?.play?.url || null,
+        slug: model.slug || ''
+      };
+    }).filter((t) => t.streamUrl);
+    res.json({ connected: true, tracks });
+  } catch (error) {
+    res.status(502).json({ message: error.message || 'Audio.com is unavailable.', connected: true });
+  }
+});
+
 app.post('/api/register', async (req, res) => { const { email, password, name } = req.body || {}; if (!email || !password || !name || password.length < 6) return res.status(400).json({ message: 'Name, email, and a 6+ character password are required.' }); const db = readDb(); if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ message: 'An account with that email already exists.' }); const user = { id: crypto.randomUUID(), email: email.toLowerCase().trim(), name: name.trim(), passwordHash: await bcrypt.hash(password, 10), createdAt: new Date().toISOString() }; db.users.push(user); writeDb(db); const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); res.json({ token, user: safeUser(user) }); });
 app.post('/api/login', async (req, res) => { const { email, password } = req.body || {}; const db = readDb(); const user = db.users.find(u => u.email.toLowerCase() === String(email || '').toLowerCase()); if (!user || !(await bcrypt.compare(password || '', user.passwordHash))) return res.status(401).json({ message: 'Email or password is incorrect.' }); const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); res.json({ token, user: safeUser(user) }); });
 app.get('/api/me', auth, (req, res) => { const db = readDb(); const user = db.users.find(u => u.id === req.user.id); if (!user) return res.status(404).json({ message: 'User not found.' }); res.json({ user: safeUser(user) }); });
